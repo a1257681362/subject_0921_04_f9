@@ -467,3 +467,55 @@ CLOSED 后发现数据问题 --只能追加--> 冲正单（t_turnover_correction
 ### 测试
 
 `mvn test`：新增 2 个集成用例（全链路造数：车辆/订单/交还车 → 统计 → 重算 → 关账 → 冲正）覆盖计数口径与比率复算（含 NO-BRANCH 归集、零订单网点、在租车辆）、当天重算刷新与重算计数、关账冻结拒绝改写、关账后重算 409、未关账冲正 409、原因必填 400、冲正后基线不变+最终值正确、作业留痕（SUCCESS/FAILED）、未登录 401 与调度员 403。
+
+## 车辆档期/预约占位（schedule-1）
+
+背景：前任同事交接不清，车辆档期靠人工口头协调，约车位冲突频发、一车两约。本期把车辆档期系统化：**预约冲突按区间重叠判定（前后各留缓冲），占位先锁位、超时未确认或取消自动释放，冲突时系统推荐最近空档。** 本期**不动审批流**，相关需求进下期；交车/还车主链路（pickup/return）不改动。
+
+### 占用与冲突判定（区间重叠 + 前后缓冲）
+
+- 每条生效占用（HOLD/CONFIRMED）在既有占用一侧扩成阻断段 `[start_at - buffer, end_at + buffer)`，与新预约的**原始**区间做半开区间严格相交：`newStart < blockedEnd && newEnd > blockedStart` 即冲突。
+- **缓冲只施加一次**（落在既有占用侧），相邻两单间隔正好一个缓冲即放行，不会因双方各算一次被误判成要 24 分钟。
+- 默认 `evops.schedule.buffer-minutes=12`：新单起点距既有单终点**正好 12 分钟放行，不足 12 分钟（落在缓冲内）拒绝**，时间重叠/包含/跨段同理拒绝。
+- 仅 HOLD/CONFIRMED 计占用；CANCELLED/EXPIRED 行保留全量留痕但不参与档期，释放后原时段立即可再约。
+
+### 锁位与自动释放
+
+```
+创建 HOLD（hold_expires_at = now + 25min）--确认--> CONFIRMED
+HOLD --主动取消--> CANCELLED（释放留痕）
+HOLD --超过 25 分钟未确认--> EXPIRED（自动释放留痕）
+```
+
+- 默认 `evops.schedule.hold-ttl-minutes=25`：占位即锁位 25 分钟，逾期未确认自动释放。
+- 周期作业按 `evops.schedule.release-scan-interval-ms`（默认每分钟）扫描到期 HOLD 置 EXPIRED；**确认入口也即时判定超时**（独立事务先落 EXPIRED 再拒绝，不被业务异常回滚带走），不必干等扫描。
+- 取消（HOLD/CONFIRMED 均可）立即释放；重复确认/重复取消幂等。
+- `evops.schedule.enabled=false` 为应急总开关（不影响手工触发释放接口）。
+
+### 冲突推荐最近空档
+
+- 创建冲突返回 **409，`code=SCHEDULE_CONFLICT`**，`data` 内含车辆、缓冲分钟、冲突占位 id 与系统推荐的**最近空档**（已扣除相邻占用的前后缓冲，直接可用）。
+- 推荐算法：在合并后的阻断段时间轴上，从期望起点向后找第一个能容纳期望租期时长的窗口；可落在前后两单的缓冲缝隙之间。
+- 另提供只读试算接口，下单前先查最近空档。
+
+### 并发防双占
+
+同一车辆的占位创建在业务事务内先 `SELECT ... FOR UPDATE` 锁住车辆行串行化：两个并行预约同一时段，后到者读到先到者已提交的占位而判冲突，**恰好一个成功**；状态确认/取消另以乐观锁 CAS 兜底。
+
+### 接口速览
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | /api/schedule/bookings | 创建占位（HOLD，锁位 25 分钟）；冲突 409 + 推荐最近空档 |
+| POST | /api/schedule/bookings/{id}/confirm | 确认占位（逾期未确认拒绝并已自动释放） |
+| POST | /api/schedule/bookings/{id}/cancel | 取消占位，立即释放档期 |
+| GET | /api/schedule/bookings/{id} | 占位详情 |
+| GET | /api/schedule/bookings | 档期查询（vehicleId/status/from/to，开始时间升序） |
+| GET | /api/schedule/vehicles/{vehicleId}/free-slot | 试算指定区间的最近可用空档（只读） |
+| POST | /api/schedule/release-expired | 手工触发超时释放（应急/排障），返回释放数 |
+
+写请求遵循三件套（`X-Operator` / `X-Request-No` / 可选 `X-Biz-Time`）与入口幂等。表 `t_vehicle_schedule`（booking_no 唯一；HOLD/CONFIRMED/CANCELLED/EXPIRED；start/end、buffer_minutes、hold_expires_at 及确认/取消/超时时间戳；全量留痕，不做物理删除）。
+
+### 测试
+
+`mvn test`：新增 12 个集成用例覆盖前后缓冲 12 分钟边界（正好 12 分钟放行、11 分钟拒绝）、重叠各形态拒绝、锁位到期时间戳与确认流转、CONFIRMED 仍占用、取消释放后原时段可再约、确认时已超时拒绝并即时置 EXPIRED、周期扫描释放、冲突 409 返回推荐最近空档、多占用缝隙间推荐、同车并行预约只成功一个（FOR UPDATE）、非法区间/缺字段/缺头/车辆不存在校验、同请求号重复提交拦截、档期状态过滤查询。全量 78 个用例通过（既有 66 个零改动回归）。

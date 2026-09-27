@@ -60,6 +60,12 @@ evops:
     enabled: true
     # 凌晨关账作业（默认每天 04:00，避开对账 02:00/03:00 作业）
     daily-close-cron: "0 0 4 * * ?"
+  # 车辆档期/预约占位（schedule-1）：缓冲 12 分钟、锁位 25 分钟超时释放。
+  schedule:
+    enabled: true
+    buffer-minutes: 12
+    hold-ttl-minutes: 25
+    release-scan-interval-ms: 60000
   # 交车生命周期状态机（rental-fsm-1）：合法路径集中在此配置，代码不硬编码状态判断。
   # 越级（如 CREATED 直接 ARCHIVE）、回退（如 RENTING 退回 CREATED）、未知动作都因
   # “不在合法路径内”被统一拒绝。新增状态/动作只在此加规则并重启生效，不改代码；

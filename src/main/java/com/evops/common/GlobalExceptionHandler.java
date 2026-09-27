@@ -33,6 +33,13 @@ public class GlobalExceptionHandler {
         return ApiResponse.fail(ex.getMessage());
     }
 
+    /** 业务规则冲突且需回传结构化数据（如档期冲突附带推荐空档）；须在通用 BizException 之前匹配更具体类型 */
+    @ExceptionHandler(PayloadBizException.class)
+    @ResponseStatus(HttpStatus.CONFLICT)
+    public ApiResponse<Object> handlePayloadBiz(PayloadBizException ex) {
+        return ApiResponse.fail(ex.getCode(), ex.getMessage(), ex.getPayload());
+    }
+
     /** 入口幂等/库层唯一约束冲突（如订单号重复） */
     @ExceptionHandler(DuplicateKeyException.class)
     @ResponseStatus(HttpStatus.CONFLICT)
