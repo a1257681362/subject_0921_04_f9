@@ -467,3 +467,64 @@ CLOSED 后发现数据问题 --只能追加--> 冲正单（t_turnover_correction
 ### 测试
 
 `mvn test`：新增 2 个集成用例（全链路造数：车辆/订单/交还车 → 统计 → 重算 → 关账 → 冲正）覆盖计数口径与比率复算（含 NO-BRANCH 归集、零订单网点、在租车辆）、当天重算刷新与重算计数、关账冻结拒绝改写、关账后重算 409、未关账冲正 409、原因必填 400、冲正后基线不变+最终值正确、作业留痕（SUCCESS/FAILED）、未登录 401 与调度员 403。
+
+## 车辆档期（schedule-1）
+
+背景：前任未交接，车辆档期此前没有系统管，现场靠口头/记忆，撞单、占着位不确认、取消不放档期频发。本期把车辆档期统一收归系统：**预约冲突按区间重叠（含前后缓冲）判定；占位需在锁位时限内确认，取消或超时未确认自动释放；冲突时推荐最近空档。本期不含审批流，档期只负责时间占用本身。**
+
+### 占用与冲突口径（半开区间 + 前后缓冲）
+
+- 占用按半开区间 `[startTime, endTime)` 比较：前一单结束时刻 = 下一单开始时刻（即紧邻）本身不冲突；
+- 每段占用前后各留缓冲（默认 **12 分钟**，`evops.schedule.buffer-minutes`）：把既有占用扩成禁占区间 `[start-12, end+12)`，新区间 `[s,e)` 满足 `s < end+12 && e > start-12` 即重叠冲突；
+- **间隔恰为 12 分钟允许，小于 12 分钟（如 11 分钟）拒绝**——给现场留出/入车准备时间；
+- 判定只统计在占状态 `HELD/CONFIRMED`，`CANCELLED/EXPIRED` 行保留留痕但不再挡单。
+
+### 占位生命周期
+
+```
+占位 HELD（held_deadline = 占位时刻 + 25 分钟）
+  ├─ 锁位期内 confirm --> CONFIRMED
+  ├─ 任何在占阶段 cancel --> CANCELLED（释放档期，原因留痕）
+  └─ 超过 held_deadline 未确认 --> EXPIRED（自动释放）
+```
+
+- **锁位 25 分钟**（`evops.schedule.lock-ttl-minutes`）：`HELD` 到期未确认由周期作业默认**每分钟**扫描自动置 `EXPIRED`（`evops.schedule.release-cron`）；
+- 读取路径（再占位、可用性校验）在本车事务内还做了**懒释放**——即便扫描有延迟，超时占位也不会挡住新预约；
+- 确认时发现已超时：先在独立事务落 `EXPIRED` 提交，再 409 拒绝确认（释放不会随拒绝回滚）；已释放占位不可确认，需重新占位；
+- 确认/取消对已处理状态幂等；全量留痕，不做物理删除。
+
+### 冲突推荐最近空档
+
+占位/可用性校验冲突时，响应 `code=SCHEDULE_CONFLICT`（HTTP 409），`data` 里回传保持原时长、从请求开始时刻向后找到的最早可约区间（合并禁占区间后顺延，最远搜 14 天，超范围不回传）；也可单独调 `GET /api/schedules/next-slot`。
+
+### 并发安全
+
+同一辆车的占位在单事务内先对 `t_vehicle` 行加 `FOR UPDATE` 行锁，再懒释放→判冲突→写入。两个并发占位串行化判定：影响到的那一个成功，后到者看到前者占用后 409 冲突并拿到同样的空档建议，不会出现双占。H2 锁超时已调到 5 秒（生产可按库另行配置）。
+
+### 接口速览
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | /api/schedules | 占位（[start,end)；落 HELD，deadline=now+25min；冲突 409 带空档建议） |
+| POST | /api/schedules/{id}/confirm | 锁位期内确认占位（超时/已释放 409；确认幂等） |
+| POST | /api/schedules/{id}/cancel | 取消释放（HELD/CONFIRMED→CANCELLED，原因可选留痕；取消幂等） |
+| GET | /api/schedules?vehicleId=&from=&to=&includeAll= | 某车时间窗内档期（默认仅 HELD/CONFIRMED） |
+| GET | /api/schedules/{id} | 档期记录详情 |
+| GET | /api/schedules/availability?vehicleId=&start=&end= | 可用性校验（冲突带最近空档） |
+| GET | /api/schedules/next-slot?vehicleId=&start=&end= | 单独推荐最近空档 |
+| POST | /api/schedules/release-overdue | 手工触发超时释放（应急/补跑） |
+
+写请求遵循三件套（X-Operator/X-Request-No/可选 X-Biz-Time）与入口幂等；周期作业以 SYS_SCHEDULE 身份留痕。`evops.schedule.enabled=false` 为应急总开关（只停周期扫描，不影响手工释放）。
+
+### 配置项
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| evops.schedule.buffer-minutes | 12 | 每段占用前后缓冲分钟数，间隔小于此值冲突，恰为此值允许 |
+| evops.schedule.lock-ttl-minutes | 25 | 占位锁位时限，到期未确认自动释放 |
+| evops.schedule.release-cron | `0 * * * * ?` | 超时占位扫描周期（每分钟） |
+| evops.schedule.enabled | true | 周期扫描应急开关（不影响手工接口） |
+
+### 测试
+
+`mvn test`：新增 12 个集成用例覆盖占位成功与 25 分钟锁位截止、结束早于开始拒绝、完全重叠 409 带最近空档（11:12 起、时长不变）、缓冲边界（12 分钟允许/11 分钟拒绝，前后两侧）、可用性视图、确认成功与确认幂等、超时确认 409 且占位 EXPIRED、取消释放后同窗可重约、周期释放超时占位与二次扫描幂等、未扫描时新占位懒释放、同一辆车并发占位恰一个成功+败者拿冲突、车辆不存在/停用拦截。

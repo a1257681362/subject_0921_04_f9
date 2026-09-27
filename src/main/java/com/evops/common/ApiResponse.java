@@ -33,6 +33,16 @@ public class ApiResponse<T> {
         return response;
     }
 
+    /** 业务失败但需回传结构化数据（如档期冲突时推荐的最近空档）。 */
+    public static <T> ApiResponse<T> fail(String code, String message, T data) {
+        ApiResponse<T> response = new ApiResponse<>();
+        response.success = false;
+        response.code = code;
+        response.message = message;
+        response.data = data;
+        return response;
+    }
+
     public boolean isSuccess() { return success; }
     public String getMessage() { return message; }
     public String getCode() { return code; }

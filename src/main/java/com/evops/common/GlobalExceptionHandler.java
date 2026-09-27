@@ -33,6 +33,20 @@ public class GlobalExceptionHandler {
         return ApiResponse.fail(ex.getMessage());
     }
 
+    /** 档期冲突：409 且在 data 回传系统推荐的最近空档，供现场直接改约 */
+    @ExceptionHandler(com.evops.schedule.ScheduleConflictException.class)
+    @ResponseStatus(HttpStatus.CONFLICT)
+    public ApiResponse<java.util.Map<String, Object>> handleScheduleConflict(
+            com.evops.schedule.ScheduleConflictException ex) {
+        java.util.Map<String, Object> data = null;
+        if (ex.getSuggestedStart() != null && ex.getSuggestedEnd() != null) {
+            data = new java.util.LinkedHashMap<>();
+            data.put("suggestedStart", ex.getSuggestedStart());
+            data.put("suggestedEnd", ex.getSuggestedEnd());
+        }
+        return ApiResponse.fail("SCHEDULE_CONFLICT", ex.getMessage(), data);
+    }
+
     /** 入口幂等/库层唯一约束冲突（如订单号重复） */
     @ExceptionHandler(DuplicateKeyException.class)
     @ResponseStatus(HttpStatus.CONFLICT)

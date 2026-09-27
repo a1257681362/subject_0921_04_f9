@@ -20,6 +20,9 @@ spring:
     username: sa
     password:
     driver-class-name: org.h2.Driver
+    # 档期并发放置经 t_vehicle 行锁串行化判定：放宽 H2 默认 1s 锁等待到 5s。
+    hikari:
+      connection-init-sql: SET LOCK_TIMEOUT 5000
   h2:
     console:
       enabled: false

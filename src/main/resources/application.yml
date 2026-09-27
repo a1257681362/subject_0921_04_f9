@@ -20,6 +20,10 @@ spring:
     username: sa
     password:
     driver-class-name: org.h2.Driver
+    # 档期并发放置经 t_vehicle 行锁串行化判定：H2 默认锁等待仅 1s，
+    # 放宽到 5s，让后到事务短暂等待先行者提交后再判冲突，而不是直接锁超时报错。
+    hikari:
+      connection-init-sql: SET LOCK_TIMEOUT 5000
   h2:
     console:
       enabled: false
@@ -60,6 +64,16 @@ evops:
     enabled: true
     # 凌晨关账作业（默认每天 04:00，避开对账 02:00/03:00 作业）
     daily-close-cron: "0 0 4 * * ?"
+  # 车辆档期（schedule-1）：预约占位统一系统管理。冲突按区间重叠（含前后缓冲）判定；
+  # 占位需在锁位时限内确认，取消或超时未确认自动释放；冲突推荐最近空档。本期不含审批流。
+  schedule:
+    enabled: true
+    # 每段占用前后各留的缓冲（分钟）：新区间与相邻占用间隔小于该值即冲突，恰为该值允许
+    buffer-minutes: 12
+    # 占位锁位时限（分钟）：HELD 到期未确认由周期作业自动置 EXPIRED 释放
+    lock-ttl-minutes: 25
+    # 超时占位扫描周期（默认每分钟；H2/单实例，靠行级锁与懒过期兜底并发）
+    release-cron: "0 * * * * ?"
   # 交车生命周期状态机（rental-fsm-1）：合法路径集中在此配置，代码不硬编码状态判断。
   # 越级（如 CREATED 直接 ARCHIVE）、回退（如 RENTING 退回 CREATED）、未知动作都因
   # “不在合法路径内”被统一拒绝。新增状态/动作只在此加规则并重启生效，不改代码；
